@@ -277,11 +277,11 @@ fi
 if [ -f "$SRC_DIR/web/package.json" ]; then
     # ── Patches for reverse-proxy compatibility (idempotent) ──
     # The upstream dashboard assumes it's served at the URL root, using
-    # absolute paths (/api/*, /dashboard-plugins/*) that break behind a
-    # reverse proxy. We patch three files so ALL API and plugin requests
-    # are prefixed with the SPA's actual mount point — stable across HA
-    # Ingress, direct ports, custom reverse proxies, and React Router
-    # client-side navigation.
+    # absolute paths (/api/*, /dashboard-plugins/*) and a root BrowserRouter
+    # that break behind a reverse proxy. We patch four files so API, plugin,
+    # asset, and navigation URLs are prefixed with the SPA's actual mount point
+    # — stable across HA Ingress, direct ports, custom reverse proxies, and
+    # React Router client-side navigation.
     DASHBOARD_REBUILD="false"
 
     # 1. api.ts: compute BASE from import.meta.url (the JS chunk's runtime URL).
@@ -289,7 +289,7 @@ if [ -f "$SRC_DIR/web/package.json" ]; then
     #    stable mount path. Also exported so usePlugins.ts can reuse it.
     if ! grep -q 'HA-ADDON-BASE-PATCHED' "$SRC_DIR/web/src/lib/api.ts" 2>/dev/null; then
         if grep -qE '^const BASE = ' "$SRC_DIR/web/src/lib/api.ts" 2>/dev/null; then
-            sed -i 's|^const BASE = .*|export const BASE = new URL("..", import.meta.url).pathname.replace(/\\/$/, ""); /* HA-ADDON-BASE-PATCHED */|' "$SRC_DIR/web/src/lib/api.ts"
+            sed -i 's|^const BASE = .*|export const BASE = new URL(/* @vite-ignore */ "..", import.meta.url).pathname.replace(/\\/$/, ""); /* HA-ADDON-BASE-PATCHED */|' "$SRC_DIR/web/src/lib/api.ts"
             DASHBOARD_REBUILD="true"
         fi
     fi
@@ -312,7 +312,24 @@ if [ -f "$SRC_DIR/web/package.json" ]; then
         DASHBOARD_REBUILD="true"
     fi
 
-    # 3. vite.config.ts: inject base:"./" into defineConfig (HTML asset paths).
+    # 3. main.tsx: give BrowserRouter the same runtime mount point. Without
+    #    this, React Router renders top-level hrefs like /logs. They work while
+    #    the SPA is already loaded, but direct reloads/HA iframe refreshes hit
+    #    nginx outside /dashboard/ and return 404.
+    if grep -q 'HA-ADDON-BASE-PATCHED' "$SRC_DIR/web/src/lib/api.ts" 2>/dev/null && \
+       [ -f "$SRC_DIR/web/src/main.tsx" ] && \
+       ! grep -q 'HA-ADDON-ROUTER-BASENAME-PATCHED' "$SRC_DIR/web/src/main.tsx" 2>/dev/null; then
+        sed -i \
+            -e 's|import { BrowserRouter } from "react-router-dom";|import { BrowserRouter } from "react-router-dom";\nimport { BASE } from "@/lib/api"; /* HA-ADDON-ROUTER-BASENAME-PATCHED */|' \
+            -e 's|<BrowserRouter>|<BrowserRouter basename={BASE || "/"}>|' \
+            "$SRC_DIR/web/src/main.tsx"
+        if ! grep -q 'basename={BASE || "/"}' "$SRC_DIR/web/src/main.tsx" 2>/dev/null; then
+            echo "[run] WARNING: main.tsx BrowserRouter pattern changed upstream — dashboard links may 404 behind /dashboard/"
+        fi
+        DASHBOARD_REBUILD="true"
+    fi
+
+    # 4. vite.config.ts: inject base:"./" into defineConfig (HTML asset paths).
     #    Ensures npm run build (called by `hermes update` / `hermes web`) also
     #    produces relative script/link hrefs, not just our explicit vite build.
     if ! grep -q 'HA-ADDON-BASE-INJECTED' "$SRC_DIR/web/vite.config.ts" 2>/dev/null; then
@@ -322,7 +339,7 @@ if [ -f "$SRC_DIR/web/package.json" ]; then
         DASHBOARD_REBUILD="true"
     fi
 
-    # 4. Detect stale build (absolute paths in output → needs rebuild)
+    # 5. Detect stale build (absolute paths in output → needs rebuild)
     if grep -q 'src="/assets/' "$SRC_DIR/hermes_cli/web_dist/index.html" 2>/dev/null; then
         DASHBOARD_REBUILD="true"
     fi

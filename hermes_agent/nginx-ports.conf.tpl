@@ -1,3 +1,14 @@
+    # Direct dashboard API token guard. The SPA sends X-Hermes-Session-Token;
+    # older bundles/proxies may still send Authorization: Bearer. Accept either,
+    # then inject the bearer token upstream so Hermes' own middleware is happy.
+    # Dashboard tokens are long enough to exceed nginx's default 64-byte map bucket.
+    map_hash_bucket_size 128;
+    map "$http_x_hermes_session_token|$http_authorization" $dashboard_token_ok {
+        default 0;
+        ~^%%DASHBOARD_TOKEN%%\| 1;
+        ~^\|Bearer\ %%DASHBOARD_TOKEN%%$ 1;
+    }
+
     # ── HTTP (direct LAN access) ─────────────────────────────────────
     server {
         listen %%HTTP_PORT%%;
@@ -69,13 +80,14 @@
             proxy_set_header Authorization "Bearer %%DASHBOARD_TOKEN%%";
             proxy_buffering off;
         }
-        # All other dashboard API calls: require client to echo the SPA's
-        # injected Bearer token. Only users who loaded /dashboard/ (gated
-        # by htpasswd) ever see the token, so this closes the drive-by API
-        # access hole without adding a second auth layer in the browser.
+        # All other dashboard API calls: require the SPA session token. Only
+        # users who loaded /dashboard/ (gated by htpasswd) ever see the token,
+        # so this closes the drive-by API access hole without adding a second
+        # auth prompt in the browser. The current SPA sends X-Hermes-Session-Token;
+        # legacy bundles may send Authorization: Bearer.
         location /dashboard/api/ {
             %%AUTH_BASIC_OFF%%
-            if ($http_authorization != "Bearer %%DASHBOARD_TOKEN%%") {
+            if ($dashboard_token_ok = 0) {
                 return 401;
             }
             proxy_pass http://hermes_dashboard/api/;
@@ -85,6 +97,7 @@
             proxy_set_header Host 127.0.0.1;
             proxy_set_header X-Forwarded-Host $host;
             proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header Authorization "Bearer %%DASHBOARD_TOKEN%%";
             proxy_buffering off;
             proxy_read_timeout 300s;
             proxy_send_timeout 300s;
@@ -198,13 +211,14 @@
             proxy_set_header Authorization "Bearer %%DASHBOARD_TOKEN%%";
             proxy_buffering off;
         }
-        # All other dashboard API calls: require client to echo the SPA's
-        # injected Bearer token. Only users who loaded /dashboard/ (gated
-        # by htpasswd) ever see the token, so this closes the drive-by API
-        # access hole without adding a second auth layer in the browser.
+        # All other dashboard API calls: require the SPA session token. Only
+        # users who loaded /dashboard/ (gated by htpasswd) ever see the token,
+        # so this closes the drive-by API access hole without adding a second
+        # auth prompt in the browser. The current SPA sends X-Hermes-Session-Token;
+        # legacy bundles may send Authorization: Bearer.
         location /dashboard/api/ {
             %%AUTH_BASIC_OFF%%
-            if ($http_authorization != "Bearer %%DASHBOARD_TOKEN%%") {
+            if ($dashboard_token_ok = 0) {
                 return 401;
             }
             proxy_pass http://hermes_dashboard/api/;
@@ -215,6 +229,7 @@
             proxy_set_header X-Forwarded-Host $host;
             proxy_set_header X-Real-IP $remote_addr;
             proxy_set_header X-Forwarded-Proto https;
+            proxy_set_header Authorization "Bearer %%DASHBOARD_TOKEN%%";
             proxy_buffering off;
             proxy_read_timeout 300s;
             proxy_send_timeout 300s;
