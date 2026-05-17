@@ -12,6 +12,7 @@ PATCH_SCRIPT = ROOT / "hermes_agent" / "dashboard-patches.py"
 RUN_SH = ROOT / "hermes_agent" / "run.sh"
 NGINX_TEMPLATE = ROOT / "hermes_agent" / "nginx.conf.tpl"
 NGINX_PORTS_TEMPLATE = ROOT / "hermes_agent" / "nginx-ports.conf.tpl"
+LANDING_TEMPLATE = ROOT / "hermes_agent" / "landing.html.tpl"
 
 
 def run_dashboard_patches(src: Path, status_file: Path) -> subprocess.CompletedProcess[str]:
@@ -21,6 +22,31 @@ def run_dashboard_patches(src: Path, status_file: Path) -> subprocess.CompletedP
         text=True,
         capture_output=True,
     )
+
+
+def write_modern_dashboard_fixture(src: Path, vite_text: str = "export default defineConfig({});\n") -> None:
+    """Create a minimal current-upstream-shaped dashboard source tree."""
+    (src / "web/src/lib").mkdir(parents=True)
+    (src / "web/src/plugins").mkdir(parents=True)
+    (src / "web").mkdir(exist_ok=True)
+    (src / "web/src/lib/api.ts").write_text(
+        "function readBasePath(): string {\n"
+        "  const raw = window.__HERMES_BASE_PATH__ ?? \"\";\n"
+        "  return raw;\n"
+        "}\n"
+        "export const HERMES_BASE_PATH = readBasePath();\n"
+        "const BASE = HERMES_BASE_PATH;\n"
+        "declare global { interface Window { __HERMES_BASE_PATH__?: string; } }\n"
+    )
+    (src / "web/src/plugins/usePlugins.ts").write_text(
+        'import { api, HERMES_BASE_PATH } from "@/lib/api";\n'
+        "const baseUrl = `${HERMES_BASE_PATH}/dashboard-plugins/x.js`;\n"
+    )
+    (src / "web/src/main.tsx").write_text(
+        'import { HERMES_BASE_PATH } from "./lib/api";\n'
+        "<BrowserRouter basename={HERMES_BASE_PATH || undefined}>\n"
+    )
+    (src / "web/vite.config.ts").write_text(vite_text)
 
 
 class DashboardIngressPatchTests(unittest.TestCase):
@@ -95,35 +121,53 @@ class DashboardIngressPatchTests(unittest.TestCase):
         self.assertNotIn("BASE ||", run_sh)
         self.assertNotIn("HA-ADDON-ROUTER-BASENAME-PATCHED", run_sh)
 
-    def test_modern_dashboard_sources_are_left_unpatched(self) -> None:
-        """Current Hermes already supports proxy prefixes and should not be rewritten."""
+    def test_modern_dashboard_adds_import_meta_fallback_and_relative_vite_base(self) -> None:
+        """Modern Hermes still needs add-on-controlled paths behind long HA Ingress tokens."""
         with tempfile.TemporaryDirectory() as tmp:
             src = Path(tmp)
-            (src / "web/src/lib").mkdir(parents=True)
-            (src / "web/src/plugins").mkdir(parents=True)
-            (src / "web").mkdir(exist_ok=True)
-            (src / "web/src/lib/api.ts").write_text(
-                'export const HERMES_BASE_PATH = readBasePath();\n'
-                "const BASE = HERMES_BASE_PATH;\n"
-                "declare global { interface Window { __HERMES_BASE_PATH__?: string; } }\n"
-            )
-            (src / "web/src/plugins/usePlugins.ts").write_text(
-                'import { api, HERMES_BASE_PATH } from "@/lib/api";\n'
-                "const baseUrl = `${HERMES_BASE_PATH}/dashboard-plugins/x.js`;\n"
-            )
-            (src / "web/src/main.tsx").write_text(
-                'import { HERMES_BASE_PATH } from "./lib/api";\n'
-                "<BrowserRouter basename={HERMES_BASE_PATH || undefined}>\n"
-            )
-            (src / "web/vite.config.ts").write_text("export default defineConfig({});\n")
+            write_modern_dashboard_fixture(src)
             status = src / "status"
 
             result = run_dashboard_patches(src, status)
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(status.read_text(), "")
-            self.assertIn("source patches skipped", result.stdout)
-            self.assertNotIn("HA-ADDON", (src / "web/src/lib/api.ts").read_text())
+            self.assertEqual(status.read_text(), "changed")
+            api_text = (src / "web/src/lib/api.ts").read_text()
+            self.assertIn("HA-ADDON-IMPORT-META-FALLBACK-PATCHED", api_text)
+            self.assertIn(
+                "export const HERMES_BASE_PATH = readBasePath() || HERMES_IMPORT_META_BASE_PATH;",
+                api_text,
+            )
+            vite_text = (src / "web/vite.config.ts").read_text()
+            self.assertIn("HA-ADDON-BASE-INJECTED", vite_text)
+            self.assertIn('base: "./"', vite_text)
+
+            second_status = src / "status2"
+            second_result = run_dashboard_patches(src, second_status)
+
+            self.assertEqual(second_result.returncode, 0, second_result.stderr)
+            self.assertEqual(second_status.read_text(), "")
+
+    def test_modern_dashboard_replaces_wrong_vite_base_without_duplicate(self) -> None:
+        """An absolute Vite base must be replaced, not duplicated."""
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp)
+            write_modern_dashboard_fixture(
+                src,
+                "export default defineConfig({\n"
+                "  base: \"/\",\n"
+                "  plugins: [],\n"
+                "});\n",
+            )
+            status = src / "status"
+
+            result = run_dashboard_patches(src, status)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            vite_text = (src / "web/vite.config.ts").read_text()
+            self.assertEqual(vite_text.count("base:"), 1)
+            self.assertIn('base: "./"', vite_text)
+            self.assertNotIn('base: "/"', vite_text)
 
     def test_modern_dashboard_repairs_obsolete_legacy_base_patch(self) -> None:
         """A failed previous start may have patched api.ts before dying later."""
@@ -145,7 +189,9 @@ class DashboardIngressPatchTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(status.read_text(), "changed")
             self.assertIn("Removed obsolete dashboard BASE source patch", result.stdout)
-            self.assertIn("const BASE = HERMES_BASE_PATH;", (src / "web/src/lib/api.ts").read_text())
+            api_text = (src / "web/src/lib/api.ts").read_text()
+            self.assertIn("const BASE = HERMES_BASE_PATH;", api_text)
+            self.assertIn("HA-ADDON-IMPORT-META-FALLBACK-PATCHED", api_text)
 
     def test_modern_dashboard_repairs_pre_vite_ignore_base_patch(self) -> None:
         """Older v1.0.4 starts used the same marker without @vite-ignore."""
@@ -165,7 +211,9 @@ class DashboardIngressPatchTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(status.read_text(), "changed")
             self.assertIn("Removed obsolete dashboard BASE source patch", result.stdout)
-            self.assertIn("const BASE = HERMES_BASE_PATH;", (src / "web/src/lib/api.ts").read_text())
+            api_text = (src / "web/src/lib/api.ts").read_text()
+            self.assertIn("const BASE = HERMES_BASE_PATH;", api_text)
+            self.assertIn("HA-ADDON-IMPORT-META-FALLBACK-PATCHED", api_text)
 
     def test_legacy_dashboard_sources_are_patched_without_sed_delimiter_bug(self) -> None:
         """Legacy root-only dashboard sources still get the compatibility patches."""
@@ -198,6 +246,32 @@ class DashboardIngressPatchTests(unittest.TestCase):
             self.assertIn("`${BASE}/dashboard-plugins/", (src / "web/src/plugins/usePlugins.ts").read_text())
             self.assertIn('basename={BASE || "/"}', (src / "web/src/main.tsx").read_text())
             self.assertIn('base: "./"', (src / "web/vite.config.ts").read_text())
+
+    def test_run_script_rebuilds_any_dashboard_with_absolute_index_assets(self) -> None:
+        """Absolute Vite index assets are stale for HA Ingress, modern or legacy."""
+        run_sh = RUN_SH.read_text()
+
+        self.assertIn("grep -Eq", run_sh)
+        self.assertIn("(src|href)=\"/assets/", run_sh)
+        self.assertNotIn("! grep -q 'HERMES_BASE_PATH'", run_sh)
+
+    def test_landing_page_api_health_is_not_gateway_health(self) -> None:
+        """Disabled API must not be polled or shown as a broken Gateway."""
+        run_sh = RUN_SH.read_text()
+        landing = LANDING_TEMPLATE.read_text()
+
+        self.assertIn('SHOW_API="false"', run_sh)
+        self.assertIn('SHOW_API="true"', run_sh)
+        self.assertIn('s|%%SHOW_API%%|${SHOW_API}|g', run_sh)
+        self.assertIn('id="statusApi"', landing)
+        self.assertIn('var showApi = %%SHOW_API%%;', landing)
+        show_api_start = landing.index("if (showApi) {")
+        api_fetch = landing.index("fetch('./v1/health'", show_api_start)
+        api_else = landing.index("} else {", show_api_start)
+        self.assertLess(show_api_start, api_fetch)
+        self.assertLess(api_fetch, api_else)
+        self.assertNotIn('statusGateway', landing)
+        self.assertNotIn('Gateway</span>', landing)
 
 
 if __name__ == "__main__":
