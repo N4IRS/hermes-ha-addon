@@ -43,12 +43,34 @@ Add-on-level options are configured in the Home Assistant UI (Settings > Apps > 
 | `enable_terminal`     | `false`                                            | Enable web terminal on direct HTTP/HTTPS ports                                  |
 | `enable_api`          | `false`                                            | Enable the OpenAI-compatible API server on direct HTTP/HTTPS ports              |
 | `access_password`     |                                                    | Password for HTTP/HTTPS access (web terminal). Also used as the server API key  |
-| `env_vars`            | `OPENROUTER_API_KEY` (example)                     | Hermes .env variables — written to `~/.hermes/.env` on each start               |
-| `hermes_home`         | `.hermes`                                          | Agent profile directory (relative to ~). Change to switch profiles (e.g. "amy") |
+| `env_vars`            | `OPENROUTER_API_KEY` (example)                     | Hermes .env variables — written to each profile's `.env` on each start          |
+| `hermes_home`         | `.hermes`                                          | Single-profile mode: agent profile directory (relative to ~). Ignored if `profiles` is non-empty |
+| `profiles`            | `[]`                                               | Multi-profile mode: list of profile directories run concurrently. First entry is the primary |
+| `profile_env_vars`    | `[]`                                               | Per-profile `.env` overrides: each entry is `{profile, name, value}` where `profile` matches a directory in `profiles` |
 
-API keys can be configured in two places: `env_vars` above (convenient, via Home Assistant UI) or `~/.hermes/.env` directly (full list, via terminal or `hermes setup`). Non-empty `env_vars` are written to `.env` on each start, overriding existing entries.
+API keys can be configured in two places: `env_vars` above (convenient, via Home Assistant UI) or each profile's `.env` directly (full list, via terminal or `hermes setup`). Non-empty top-level `env_vars` are written to every profile's `.env` on each start, overriding existing entries. `profile_env_vars` entries layer on top of the top-level set for the profile whose directory matches `profile`.
 
-**Note:** Values added via `env_vars` are not removed or reset from `.env` when cleared or removed in the Home Assistant UI -- edit `~/.hermes/.env` directly to remove them.
+### Running multiple profiles concurrently
+
+Set `profiles` to run several Hermes instances in the same add-on. Per-profile env overrides live in `profile_env_vars` and reference each profile by its directory string (the schema stays flat because Home Assistant Supervisor only allows nested objects two levels deep):
+
+```yaml
+profiles:
+  - .hermes
+  - amy
+  - bob
+profile_env_vars:
+  - profile: amy
+    name: OPENROUTER_API_KEY
+    value: amy-only-key
+  - profile: amy
+    name: SOME_AMY_VAR
+    value: amy-special
+```
+
+The first entry is the **primary** — it keeps the existing root URLs (`/hermes/`, `/dashboard/`, `/terminal/`, `/v1/`). Each additional profile is exposed under `/profile/<name>/...`. Per-profile ports allocate from a base + index (`8642`, `49269`, `49369`, `49469`).
+
+**Note:** Values added via `env_vars` are not removed or reset from `.env` when cleared or removed in the Home Assistant UI -- edit each profile's `.env` directly to remove them.
 
 Hermes-internal configuration (model, platforms, memory, tools) is managed via the terminal:
 
@@ -155,8 +177,8 @@ Four services in a Debian Bookworm container:
 
 1. **Hermes Gateway** (`hermes gateway run`) -- persistent AI agent daemon with OpenAI-compatible API server and messaging platform connectors. Logs visible in the Home Assistant add-on log and in `~/.hermes/logs/gateway.log`.
 2. **Hermes Dashboard** (`hermes dashboard`) -- browser-based management UI (FastAPI + React) for config, API keys, sessions, analytics, logs, cron jobs, and skills.
-3. **ttyd** (x2) -- web terminals backed by persistent tmux sessions (`hermes` + `terminal`)
-4. **nginx** -- HTTP, HTTPS, and Home Assistant ingress proxy routing to dashboard + terminal + API
+3. **ttyd** (×2 per profile) -- web terminals backed by persistent tmux sessions (`hermes-<name>` + `terminal-<name>`)
+4. **nginx** -- HTTP, HTTPS, and Home Assistant ingress proxy routing to dashboard + terminal + API. Multi-profile setups serve `/profile/<name>/...` for non-primary profiles.
 
 ### Shell Environment
 

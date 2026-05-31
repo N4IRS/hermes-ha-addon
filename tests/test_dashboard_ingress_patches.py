@@ -4,12 +4,14 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
 PATCH_SCRIPT = ROOT / "hermes_agent" / "dashboard-patches.py"
 RUN_SH = ROOT / "hermes_agent" / "run.sh"
+NGINX_RENDER_LIB = ROOT / "hermes_agent" / "nginx-render.sh"
 NGINX_TEMPLATE = ROOT / "hermes_agent" / "nginx.conf.tpl"
 NGINX_PORTS_TEMPLATE = ROOT / "hermes_agent" / "nginx-ports.conf.tpl"
 LANDING_TEMPLATE = ROOT / "hermes_agent" / "landing.html.tpl"
@@ -22,6 +24,88 @@ def run_dashboard_patches(src: Path, status_file: Path) -> subprocess.CompletedP
         text=True,
         capture_output=True,
     )
+
+
+def render_nginx_fragment(*, server_kind: str, profiles=None, flags=None) -> str:
+    """Source the nginx-render lib with a mock profile setup and capture a fragment."""
+    if profiles is None:
+        profiles = [(".hermes", "hermes", ""), ("amy", "amy", "/profile/amy")]
+    flags = flags or {}
+    enable_terminal = flags.get("enable_terminal", "true")
+    enable_api = flags.get("enable_api", "true")
+    enable_dashboard = flags.get("enable_dashboard", "true")
+    dashboard_available = flags.get("dashboard_available", "true")
+
+    dirs = " ".join(f'"{d}"' for d, _, _ in profiles)
+    names = " ".join(f'"{n}"' for _, n, _ in profiles)
+    prefixes = " ".join(f'"{p}"' for _, _, p in profiles)
+    n = len(profiles)
+    ports_api = " ".join(str(8642 + i) for i in range(n))
+    ports_th = " ".join(str(49269 + i) for i in range(n))
+    ports_tt = " ".join(str(49369 + i) for i in range(n))
+    ports_dash = " ".join(str(49469 + i) for i in range(n))
+    tokens = " ".join(f'"TOK{i}"' for i in range(n))
+
+    script = textwrap.dedent(f"""
+        set -euo pipefail
+        source "{NGINX_RENDER_LIB}"
+        PROFILE_DIRS=({dirs})
+        PROFILE_NAMES=({names})
+        PROFILE_PATH_PREFIX=({prefixes})
+        API_PORTS=({ports_api})
+        TTYD_HERMES_PORTS=({ports_th})
+        TTYD_TERMINAL_PORTS=({ports_tt})
+        DASHBOARD_PORTS=({ports_dash})
+        DASHBOARD_TOKENS=({tokens})
+        DASHBOARD_AVAILABLE="{dashboard_available}"
+        ENABLE_TERMINAL="{enable_terminal}"
+        ENABLE_API="{enable_api}"
+        ENABLE_DASHBOARD="{enable_dashboard}"
+        emit_profile_locations {server_kind}
+    """)
+    result = subprocess.run(
+        ["bash", "-c", script],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    return result.stdout
+
+
+def render_nginx_section(section: str, *, profiles=None) -> str:
+    """Render upstreams / dashboard_maps / token_maps from the lib."""
+    if profiles is None:
+        profiles = [(".hermes", "hermes", ""), ("amy", "amy", "/profile/amy")]
+    dirs = " ".join(f'"{d}"' for d, _, _ in profiles)
+    names = " ".join(f'"{n}"' for _, n, _ in profiles)
+    prefixes = " ".join(f'"{p}"' for _, _, p in profiles)
+    n = len(profiles)
+    ports_api = " ".join(str(8642 + i) for i in range(n))
+    ports_th = " ".join(str(49269 + i) for i in range(n))
+    ports_tt = " ".join(str(49369 + i) for i in range(n))
+    ports_dash = " ".join(str(49469 + i) for i in range(n))
+    tokens = " ".join(f'"TOK{i}"' for i in range(n))
+
+    script = textwrap.dedent(f"""
+        set -euo pipefail
+        source "{NGINX_RENDER_LIB}"
+        PROFILE_DIRS=({dirs})
+        PROFILE_NAMES=({names})
+        PROFILE_PATH_PREFIX=({prefixes})
+        API_PORTS=({ports_api})
+        TTYD_HERMES_PORTS=({ports_th})
+        TTYD_TERMINAL_PORTS=({ports_tt})
+        DASHBOARD_PORTS=({ports_dash})
+        DASHBOARD_TOKENS=({tokens})
+        emit_{section}
+    """)
+    result = subprocess.run(
+        ["bash", "-c", script],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    return result.stdout
 
 
 def write_modern_dashboard_fixture(src: Path, vite_text: str = "export default defineConfig({});\n") -> None:
@@ -66,52 +150,76 @@ class DashboardIngressPatchTests(unittest.TestCase):
 
     def test_nginx_keeps_dashboard_deep_links_under_dashboard_prefix(self) -> None:
         """Direct /dashboard/<route> reloads must keep proxying to the SPA."""
-        nginx_conf = NGINX_TEMPLATE.read_text()
+        rendered = render_nginx_fragment(server_kind="ingress")
 
-        self.assertIn("location = /dashboard { return 302 /dashboard/; }", nginx_conf)
-        self.assertIn("location /dashboard/api/", nginx_conf)
-        self.assertIn("location /dashboard/", nginx_conf)
-        self.assertIn("proxy_pass http://hermes_dashboard/;", nginx_conf)
+        self.assertIn("location = /dashboard { return 302 /dashboard/; }", rendered)
+        self.assertIn("location /dashboard/api/", rendered)
+        self.assertIn("location /dashboard/", rendered)
+        self.assertIn("proxy_pass http://hermes_dashboard_0/;", rendered)
 
     def test_direct_port_dashboard_api_accepts_spa_session_header(self) -> None:
-        """Direct-port nginx guard must match the SPA's current token header.
+        """Direct-port nginx guard must match the SPA's current token header."""
+        token_maps = render_nginx_section("token_maps")
 
-        The React dashboard sends X-Hermes-Session-Token, not Authorization.
-        Direct LAN ports turn basic auth off for /dashboard/api/* and rely on
-        nginx to verify the SPA token before proxying, so checking only
-        $http_authorization rejects the legitimate dashboard with 401.
-        """
-        nginx_ports = (ROOT / "hermes_agent" / "nginx-ports.conf.tpl").read_text()
+        self.assertIn("$http_x_hermes_session_token", token_maps)
+        self.assertIn("$dashboard_token_ok_0", token_maps)
+        self.assertIn("~^TOK0\\|", token_maps)
+        self.assertIn("~^\\|Bearer\\ TOK0$", token_maps)
+        # Per-profile maps are emitted, one per profile.
+        self.assertIn("$dashboard_token_ok_1", token_maps)
 
-        self.assertIn("$http_x_hermes_session_token", nginx_ports)
-        self.assertIn("$dashboard_token_ok", nginx_ports)
-        self.assertIn("~^%%DASHBOARD_TOKEN%%\\|", nginx_ports)
-        self.assertIn("~^\\|Bearer\\ %%DASHBOARD_TOKEN%%$", nginx_ports)
-        self.assertNotIn("$http_authorization != \"Bearer %%DASHBOARD_TOKEN%%\"", nginx_ports)
-
-    def test_nginx_sets_map_hash_bucket_size_before_first_map(self) -> None:
+    def test_nginx_sets_map_hash_bucket_size_before_dashboard_maps(self) -> None:
         """nginx rejects map_hash_bucket_size after any map block has been parsed."""
         nginx_conf = NGINX_TEMPLATE.read_text()
         nginx_ports = NGINX_PORTS_TEMPLATE.read_text()
 
+        # The template's static prelude sets the hash size; per-profile map blocks
+        # are inserted at the %%DASHBOARD_MAPS%% marker that follows it.
         self.assertIn("map_hash_bucket_size 128;", nginx_conf)
         self.assertLess(
             nginx_conf.index("map_hash_bucket_size 128;"),
-            nginx_conf.index("map $http_x_forwarded_prefix"),
+            nginx_conf.index("%%DASHBOARD_MAPS%%"),
         )
         self.assertNotIn("map_hash_bucket_size", nginx_ports)
 
     def test_nginx_forwards_dashboard_prefix_to_modern_hermes(self) -> None:
         """Modern Hermes reads X-Forwarded-Prefix to set SPA base paths."""
-        nginx_conf = NGINX_TEMPLATE.read_text()
-        nginx_ports = NGINX_PORTS_TEMPLATE.read_text()
+        dashboard_maps = render_nginx_section("dashboard_maps")
+        ingress_fragment = render_nginx_fragment(server_kind="ingress")
+        http_fragment = render_nginx_fragment(server_kind="http")
+        https_fragment = render_nginx_fragment(server_kind="https")
 
-        self.assertIn("map $http_x_forwarded_prefix $dashboard_proxy_prefix", nginx_conf)
-        self.assertIn("map $http_x_ingress_path $dashboard_forwarded_prefix", nginx_conf)
-        self.assertIn('default "$http_x_ingress_path/dashboard";', nginx_conf)
-        self.assertIn('"" $dashboard_proxy_prefix;', nginx_conf)
-        self.assertEqual(nginx_conf.count("proxy_set_header X-Forwarded-Prefix"), 2)
-        self.assertEqual(nginx_ports.count("proxy_set_header X-Forwarded-Prefix"), 6)
+        # Primary keeps the legacy "/dashboard" suffix; non-primary uses its prefix.
+        self.assertIn("map $http_x_forwarded_prefix $dashboard_proxy_prefix_0", dashboard_maps)
+        self.assertIn("map $http_x_ingress_path $dashboard_forwarded_prefix_0", dashboard_maps)
+        self.assertIn('default "$http_x_ingress_path/dashboard";', dashboard_maps)
+        self.assertIn('default "$http_x_ingress_path/profile/amy/dashboard";', dashboard_maps)
+
+        # Ingress: 2 dashboard locations × 2 profiles = 4 X-Forwarded-Prefix headers.
+        self.assertEqual(ingress_fragment.count("proxy_set_header X-Forwarded-Prefix"), 4)
+        # Direct HTTP/HTTPS: 3 dashboard locations (status, api/, /) × 2 profiles = 6.
+        self.assertEqual(http_fragment.count("proxy_set_header X-Forwarded-Prefix"), 6)
+        self.assertEqual(https_fragment.count("proxy_set_header X-Forwarded-Prefix"), 6)
+
+    def test_nginx_non_primary_profile_uses_path_prefix(self) -> None:
+        """Non-primary profiles must be reachable under /profile/<name>/..."""
+        rendered = render_nginx_fragment(server_kind="ingress")
+
+        self.assertIn("location /profile/amy/hermes/", rendered)
+        self.assertIn("location /profile/amy/terminal/", rendered)
+        self.assertIn("location /profile/amy/v1/", rendered)
+        self.assertIn("location /profile/amy/dashboard/", rendered)
+        # Each non-primary location proxies to its own per-profile upstream.
+        self.assertIn("proxy_pass http://hermes_dashboard_1/;", rendered)
+        self.assertIn("proxy_pass http://hermes_api_1/v1/;", rendered)
+
+    def test_nginx_upstreams_are_per_profile(self) -> None:
+        upstreams = render_nginx_section("upstreams")
+
+        self.assertIn("upstream hermes_api_0", upstreams)
+        self.assertIn("upstream hermes_api_1", upstreams)
+        self.assertIn("server 127.0.0.1:8642", upstreams)
+        self.assertIn("server 127.0.0.1:8643", upstreams)
 
     def test_run_script_delegates_dashboard_patches_to_helper(self) -> None:
         """The startup path should not contain fragile multi-expression sed edits."""
@@ -126,13 +234,16 @@ class DashboardIngressPatchTests(unittest.TestCase):
         run_sh = RUN_SH.read_text()
 
         self.assertGreaterEqual(run_sh.count("export HERMES_GATEWAY_NO_SUPERVISE=1"), 2)
-        self.assertIn("hermes gateway run 2>&1 | tee -a \"$HERMES_HOME/logs/gateway.log\" &", run_sh)
+        # The gateway is started inside a subshell whose stdout pipes through tee
+        # to a per-profile log file. The pipe lives inside `(...)` and the whole
+        # group is backgrounded with `&`.
+        self.assertIn('"$venv/bin/hermes" gateway run 2>&1 | tee -a "$home/logs/gateway.log"', run_sh)
 
     def test_install_marker_submodule_scan_tolerates_empty_matches(self) -> None:
         """The marker calculation must not call basename with no operands."""
         run_sh = RUN_SH.read_text()
 
-        self.assertIn("find \"$SRC_DIR\" -mindepth 2 -maxdepth 2 -name pyproject.toml", run_sh)
+        self.assertIn('find "$src_dir" -mindepth 2 -maxdepth 2 -name pyproject.toml', run_sh)
         self.assertNotIn("xargs -n1 basename", run_sh)
 
     def test_modern_dashboard_adds_import_meta_fallback_and_relative_vite_base(self) -> None:
@@ -279,8 +390,9 @@ class DashboardIngressPatchTests(unittest.TestCase):
         self.assertIn('s|%%SHOW_API%%|${SHOW_API}|g', run_sh)
         self.assertIn('id="statusApi"', landing)
         self.assertIn('var showApi = %%SHOW_API%%;', landing)
+        # API health now lives behind a profile-aware prefix builder.
         show_api_start = landing.index("if (showApi) {")
-        api_fetch = landing.index("fetch('./v1/health'", show_api_start)
+        api_fetch = landing.index("/v1/health", show_api_start)
         api_else = landing.index("} else {", show_api_start)
         self.assertLess(show_api_start, api_fetch)
         self.assertLess(api_fetch, api_else)
