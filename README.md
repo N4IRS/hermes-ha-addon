@@ -193,35 +193,53 @@ The Hermes tab uses a dedicated `start-hermes` wrapper (sources .bashrc, starts 
 
 ### Persistent Storage
 
-`~` is `/config/` (add-on-isolated via `addon_config`). Everything survives add-on updates and is included in Home Assistant backups:
+Inside the add-on container, `~` is `/config`. That path is the add-on's private `addon_config` mount, not the normal Home Assistant Core `/config` folder. It survives add-on updates and is included in Home Assistant backups.
 
-```
-~ (/config/)
-├── .certs/                # TLS certificates (auto-generated or custom)
-├── .go/                   # Go workspace
-├── .hermes/               # HERMES_HOME (matches official installer layout)
-│   ├── hermes-agent/      # Git clone (source code, agent-modifiable)
-│   │   └── venv/          # Python venv (editable install)
-│   ├── logs/              # Gateway logs
-│   ├── memories/          # Long-term memory (MEMORY.md, USER.md)
-│   ├── sessions/          # Conversation state
-│   ├── skills/            # Auto-created + installed skills
-│   ├── .env               # API keys (chmod 600)
-│   ├── SOUL.md            # Agent personality
-│   ├── config.yaml        # Hermes config (model, platforms, tools)
-│   └── state.db           # SQLite FTS5 state
-├── .linuxbrew/            # Homebrew
-├── .npm-global/           # npm global packages
-├── .bash_aliases          # Custom aliases and functions (optional, user-created)
-├── .bashrc                # Shell config
-├── .hermes_install        # Install marker
-├── .hermes_profile        # Env vars + PATH (regenerated)
-├── .profile               # Sources .bashrc (login shell init)
-└── .tmux.conf             # tmux config
+From the HAOS host or Samba, look for the `addon_configs` share/folder. The host-side path usually looks like this:
 
-/media/                    # Home Assistant media directory (shared, visible in Home Assistant media browser)
-/share/                    # Home Assistant shared directory (shared between all add-ons)
+```text
+/mnt/data/supervisor/addon_configs/<repo_or_slug>_hermes_agent/
 ```
+
+For example, a locally installed/custom repository may appear as something like:
+
+```text
+/mnt/data/supervisor/addon_configs/a0b1c2d3_hermes_agent/
+```
+
+The exact prefix is installation-specific, but the important bit is: use `addon_configs`, not the regular Home Assistant Core config folder.
+
+The default single-profile layout after a successful first start is:
+
+```text
+~ (/config inside the add-on, addon_configs/..._hermes_agent on the host)
+├── .certs/                    # TLS certificates (auto-generated or custom)
+├── .go/                       # Go workspace
+├── .hermes/                   # Primary HERMES_HOME (official installer layout)
+│   ├── hermes-agent/          # Git clone (source code, agent-modifiable)
+│   │   └── venv/              # Python venv (editable install)
+│   ├── logs/                  # Gateway logs
+│   ├── memories/              # Long-term memory (MEMORY.md, USER.md)
+│   ├── sessions/              # Conversation state
+│   ├── skills/                # Auto-created + installed skills
+│   ├── .env                   # API keys (chmod 600)
+│   ├── SOUL.md                # Agent personality
+│   ├── config.yaml            # Hermes config (model, platforms, tools)
+│   └── state.db               # SQLite FTS5 state
+├── .linuxbrew/                # Homebrew
+├── .npm-global/               # npm global packages
+├── .bash_aliases              # Custom aliases and functions (optional, user-created)
+├── .bashrc                    # Shell config
+├── .hermes_install_hermes     # Install marker for the default .hermes profile
+├── .hermes_profile            # Env vars + PATH (regenerated)
+├── .profile                   # Sources .bashrc (login shell init)
+└── .tmux.conf                 # tmux config
+
+/media/                        # Home Assistant media directory (shared, visible in Home Assistant media browser)
+/share/                        # Home Assistant shared directory (shared between all add-ons)
+```
+
+Directories are created lazily during startup. If `/config/.hermes/hermes-agent` is missing inside the add-on terminal, the add-on likely has not completed the clone/install step yet; check the add-on log around the `[run] [hermes] Cloning Hermes Agent`, `Creating venv`, and `Installing Hermes` lines.
 
 ### Container Toolchain
 
@@ -240,6 +258,10 @@ Pre-installed at build time:
 
 - `amd64`
 - `aarch64`
+
+## Changelog
+
+Release notes for Home Assistant update screens live in [`hermes_agent/CHANGELOG.md`](hermes_agent/CHANGELOG.md). GitHub Releases carry the same user-facing release notes for tagged versions.
 
 ## License
 
