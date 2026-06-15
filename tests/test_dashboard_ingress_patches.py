@@ -245,10 +245,19 @@ class DashboardIngressPatchTests(unittest.TestCase):
         run_sh = RUN_SH.read_text()
 
         self.assertIn("hermes-dashboard-patches", run_sh)
-        self.assertIn('/usr/local/bin/hermes-dashboard-patches "$src_dir" "$status_file"', run_sh)
+        self.assertIn('/usr/local/bin/hermes-dashboard-patches "$SRC_DIR" "$status_file"', run_sh)
+        self.assertNotIn('hermes-dashboard-patches "$src_dir"', run_sh)
         self.assertNotIn("python /usr/local/bin/hermes-dashboard-patches", run_sh)
         self.assertNotIn("BASE ||", run_sh)
         self.assertNotIn("HA-ADDON-ROUTER-BASENAME-PATCHED", run_sh)
+
+    def test_run_script_preserves_profiles_base_default_when_option_missing(self) -> None:
+        """Upgrades from older options.json should still get the documented default."""
+        run_sh = RUN_SH.read_text()
+
+        self.assertIn('has("profiles_base")', run_sh)
+        self.assertIn('else ".hermes/profiles"', run_sh)
+        self.assertNotIn("PROFILES_BASE=$(opt profiles_base)", run_sh)
 
     def test_run_script_keeps_gateway_in_foreground_under_ha_s6(self) -> None:
         """The add-on wrapper, not upstream Hermes' s6 manager, supervises the gateway."""
@@ -258,13 +267,13 @@ class DashboardIngressPatchTests(unittest.TestCase):
         # The gateway is started inside a subshell whose stdout pipes through tee
         # to a per-profile log file. The pipe lives inside `(...)` and the whole
         # group is backgrounded with `&`.
-        self.assertIn('"$venv/bin/hermes" gateway run 2>&1 | tee -a "$home/logs/gateway.log"', run_sh)
+        self.assertIn('"$VENV_DIR/bin/hermes" gateway run 2>&1 | tee -a "$home/logs/gateway.log"', run_sh)
 
     def test_install_marker_submodule_scan_tolerates_empty_matches(self) -> None:
         """The marker calculation must not call basename with no operands."""
         run_sh = RUN_SH.read_text()
 
-        self.assertIn('find "$src_dir" -mindepth 2 -maxdepth 2 -name pyproject.toml', run_sh)
+        self.assertIn('find "$SRC_DIR" -mindepth 2 -maxdepth 2 -name pyproject.toml', run_sh)
         self.assertNotIn("xargs -n1 basename", run_sh)
 
     def test_modern_dashboard_adds_import_meta_fallback_and_relative_vite_base(self) -> None:
@@ -392,6 +401,42 @@ class DashboardIngressPatchTests(unittest.TestCase):
             self.assertIn("`${BASE}/dashboard-plugins/", (src / "web/src/plugins/usePlugins.ts").read_text())
             self.assertIn('basename={BASE || "/"}', (src / "web/src/main.tsx").read_text())
             self.assertIn('base: "./"', (src / "web/vite.config.ts").read_text())
+
+    def test_prefix_length_limit_raised_for_ha_ingress(self) -> None:
+        """Upstream's normalise_prefix rejects > 64-char prefixes, which kills
+        nested addon routes (HA Ingress token + /profile/<name>/dashboard).
+        Patch must bump the limit."""
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp)
+            write_modern_dashboard_fixture(src)
+            prefix_py = src / "hermes_cli/dashboard_auth/prefix.py"
+            prefix_py.parent.mkdir(parents=True)
+            prefix_py.write_text(
+                "def normalise_prefix(raw):\n"
+                '    p = "/" + (raw or "").strip("/")\n'
+                '    if len(p) > 64:\n'
+                '        return ""\n'
+                "    return p\n"
+            )
+            status = src / "status"
+
+            result = run_dashboard_patches(src, status)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(status.read_text(), "changed")
+            patched = prefix_py.read_text()
+            self.assertIn("HA-ADDON-PREFIX-LIMIT-PATCHED", patched)
+            self.assertNotIn("if len(p) > 64:", patched)
+            # New limit must accommodate HA Ingress token (~50) +
+            # `/profile/<name>/dashboard` (up to ~50) comfortably.
+            self.assertIn("> 256:", patched)
+
+            # Idempotent on second run.
+            second_status = src / "status2"
+            second_result = run_dashboard_patches(src, second_status)
+            self.assertEqual(second_result.returncode, 0, second_result.stderr)
+            # Re-running with no other changes leaves status empty.
+            self.assertEqual(second_status.read_text(), "")
 
     def test_run_script_rebuilds_any_dashboard_with_absolute_index_assets(self) -> None:
         """Absolute Vite index assets are stale for HA Ingress, modern or legacy."""

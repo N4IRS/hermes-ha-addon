@@ -46,20 +46,22 @@ Add-on-level options are configured in the Home Assistant UI (Settings > Apps > 
 | `env_vars`            | `OPENROUTER_API_KEY` (example)                     | Hermes .env variables — written to each profile's `.env` on each start          |
 | `hermes_home`         | `.hermes`                                          | Single-profile mode: agent profile directory (relative to ~). Ignored if `profiles` is non-empty |
 | `profiles`            | `[]`                                               | Multi-profile mode: list of profile directories run concurrently. First entry is the primary |
+| `profiles_base`       | `.hermes/profiles`                                 | Default parent dir for non-dotted profile names. Entries starting with `.` are taken as-is (legacy `.hermes` keeps working). Set to empty to disable the prefix |
 | `profile_env_vars`    | `[]`                                               | Per-profile `.env` overrides: each entry is `{profile, name, value}` where `profile` matches a directory in `profiles` |
 
 API keys can be configured in two places: `env_vars` above (convenient, via Home Assistant UI) or each profile's `.env` directly (full list, via terminal or `hermes setup`). Non-empty top-level `env_vars` are written to every profile's `.env` on each start, overriding existing entries. `profile_env_vars` entries layer on top of the top-level set for the profile whose directory matches `profile`.
 
 ### Running multiple profiles concurrently
 
-Set `profiles` to run several Hermes instances in the same add-on. Per-profile env overrides live in `profile_env_vars` and reference each profile by its directory string (the schema stays flat because Home Assistant Supervisor only allows nested objects two levels deep):
+Set `profiles` to run several Hermes instances in the same add-on. Non-dotted names are placed under `profiles_base` (default `.hermes/profiles`) to match upstream's [profile layout](https://hermes-agent.nousresearch.com/docs/user-guide/profiles); entries starting with `.` are taken as-is. Per-profile env overrides live in a flat `profile_env_vars` list (Home Assistant Supervisor only allows nested objects two levels deep):
 
 ```yaml
 profiles:
-  - .hermes
-  - amy
-  - bob
+  - .hermes              # primary, kept as-is (leading "."): /config/.hermes
+  - amy                  # bare name, prefixed by profiles_base: /config/.hermes/profiles/amy
+  - bob                  # same: /config/.hermes/profiles/bob
 profile_env_vars:
+  # `profile` matches the entry above exactly (use the string you put in `profiles`).
   - profile: amy
     name: OPENROUTER_API_KEY
     value: amy-only-key
@@ -68,7 +70,11 @@ profile_env_vars:
     value: amy-special
 ```
 
+A single shared install at `~/.hermes/hermes-agent` (clone + venv) backs every profile — only the per-profile `.env`, `config.yaml`, `SOUL.md`, sessions, memories, and logs live under each profile's directory.
+
 The first entry is the **primary** — it keeps the existing root URLs (`/hermes/`, `/dashboard/`, `/terminal/`, `/v1/`). Each additional profile is exposed under `/profile/<name>/...`. Per-profile ports allocate from a base + index (`8642`, `49269`, `49369`, `49469`).
+
+**Upgrade note:** If you already used bare profile names with earlier multi-profile add-on versions, existing flat directories such as `/config/amy` are preserved automatically when the new `.hermes/profiles/amy` directory does not exist yet. To keep flat paths intentionally, set `profiles_base` to an empty string. To adopt the upstream-style layout, move the profile data to `/config/.hermes/profiles/<name>`.
 
 **Note:** Values added via `env_vars` are not removed or reset from `.env` when cleared or removed in the Home Assistant UI -- edit each profile's `.env` directly to remove them.
 
@@ -129,10 +135,11 @@ Via Home Assistant host + docker exec, no SSH server in container required. Port
 ssh -p 22222 -t root@homeassistant.local "docker exec -it \$(docker ps -qf name=hermes_agent) bash"
 
 # Hermes (shared tmux session — same as Home Assistant sidebar "Hermes" tab)
-ssh -p 22222 -t root@homeassistant.local "docker exec -it \$(docker ps -qf name=hermes_agent) tmux -u new -A -s hermes /usr/local/bin/start-hermes"
+# Replace <profile> with the sanitized profile name (e.g. "hermes" for the primary `.hermes`, "amy" for `amy`).
+ssh -p 22222 -t root@homeassistant.local "docker exec -it \$(docker ps -qf name=hermes_agent) tmux -L hermes-<profile> -u new -A -s hermes-<profile> /usr/local/bin/start-hermes"
 
 # Terminal (shared tmux session — same as Home Assistant sidebar "Terminal" tab)
-ssh -p 22222 -t root@homeassistant.local "docker exec -it \$(docker ps -qf name=hermes_agent) tmux -u new -A -s terminal bash"
+ssh -p 22222 -t root@homeassistant.local "docker exec -it \$(docker ps -qf name=hermes_agent) tmux -L terminal-<profile> -u new -A -s terminal-<profile> bash"
 
 # Copy files (e.g. upload a custom SOUL.md — works even when add-on is stopped)
 scp -P 22222 SOUL.md "root@homeassistant.local:/mnt/data/supervisor/addon_configs/*hermes_agent/.hermes/"
@@ -230,7 +237,7 @@ The default single-profile layout after a successful first start is:
 ├── .npm-global/               # npm global packages
 ├── .bash_aliases              # Custom aliases and functions (optional, user-created)
 ├── .bashrc                    # Shell config
-├── .hermes_install_hermes     # Install marker for the default .hermes profile
+├── .hermes_install            # Shared install marker for the Hermes clone + venv
 ├── .hermes_profile            # Env vars + PATH (regenerated)
 ├── .profile                   # Sources .bashrc (login shell init)
 └── .tmux.conf                 # tmux config
