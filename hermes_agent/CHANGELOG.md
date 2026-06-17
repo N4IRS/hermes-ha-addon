@@ -6,6 +6,8 @@ The format follows the spirit of [Keep a Changelog](https://keepachangelog.com/e
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-06-18
+
 ### Fixed
 
 - Keep Dashboard Chat WebSockets open behind Home Assistant Ingress by enabling `ingress_stream` and rewriting proxied dashboard API `Origin` headers to the dashboard backend host.
